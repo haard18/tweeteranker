@@ -15,6 +15,7 @@ interface RatingResult {
   originalTweetText: string
   replyText: string
   rating: number | null
+  replyUrl?: string
   error?: string
 }
 
@@ -49,6 +50,12 @@ function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+function buildTweetUrl(id?: string): string | undefined {
+  if (!id) return undefined
+  // Using twitter.com path that works without username context
+  return `https://twitter.com/i/web/status/${id}`
+}
+
 export async function processTweets(rows: CSVRow[]): Promise<RatingResult[]> {
   const results: RatingResult[] = []
 
@@ -57,6 +64,7 @@ export async function processTweets(rows: CSVRow[]): Promise<RatingResult[]> {
       const row = rows[i]
       const replyId = row.replyId
       const tweetId = row.tweetId
+  const replyUrl = buildTweetUrl(tweetId || replyId)
 
       // Only replyId and tweetId are strictly required
       if (!replyId || !tweetId) {
@@ -66,6 +74,7 @@ export async function processTweets(rows: CSVRow[]): Promise<RatingResult[]> {
           originalTweetText: '',
           replyText: '',
           rating: null,
+          replyUrl,
           error: 'Missing required fields (replyId and tweetId)',
         })
         continue
@@ -82,6 +91,7 @@ export async function processTweets(rows: CSVRow[]): Promise<RatingResult[]> {
           originalTweetText: '',
           replyText: '',
           rating: null,
+          replyUrl,
           error: 'Could not fetch reply tweet from Twitter API',
         })
         await delay(500)
@@ -125,6 +135,7 @@ export async function processTweets(rows: CSVRow[]): Promise<RatingResult[]> {
         originalTweetText,
         replyText,
         rating,
+        replyUrl,
         error: !rating ? 'Could not complete rating' : undefined,
       })
 
@@ -136,6 +147,7 @@ export async function processTweets(rows: CSVRow[]): Promise<RatingResult[]> {
         originalTweetText: rows[i].originalTweetText || '',
         replyText: rows[i].replyText || '',
         rating: null,
+        replyUrl: buildTweetUrl(rows[i].tweetId || rows[i].replyId),
         error: (error as Error).message,
       })
     }
@@ -183,6 +195,7 @@ export async function processTweetsWithLogs(
         const row = rows[i]
         const replyId = row.replyId
         const tweetId = row.tweetId
+        const replyUrl = buildTweetUrl(tweetId || replyId)
 
         // Only replyId and tweetId are strictly required
         if (!replyId || !tweetId) {
@@ -192,6 +205,7 @@ export async function processTweetsWithLogs(
             originalTweetText: '',
             replyText: '',
             rating: null,
+            replyUrl,
             error: 'Missing required fields (replyId and tweetId)',
           })
           continue
@@ -208,6 +222,7 @@ export async function processTweetsWithLogs(
             originalTweetText: '',
             replyText: '',
             rating: null,
+            replyUrl,
             error: 'Could not fetch reply tweet from Twitter API',
           })
           await delay(500)
@@ -251,6 +266,7 @@ export async function processTweetsWithLogs(
           originalTweetText,
           replyText,
           rating,
+          replyUrl,
           error: !rating ? 'Could not complete rating' : undefined,
         })
 
@@ -262,6 +278,7 @@ export async function processTweetsWithLogs(
           originalTweetText: rows[i].originalTweetText || '',
           replyText: rows[i].replyText || '',
           rating: null,
+          replyUrl: buildTweetUrl(rows[i].tweetId || rows[i].replyId),
           error: (error as Error).message,
         })
       }
@@ -327,14 +344,14 @@ async function fetchTweet(tweetId: string): Promise<Tweet | null> {
     return null
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error)
-    
+
     // Provide more detailed error messages
     if (error instanceof axios.AxiosError) {
       console.error(`✗ Twitter API Error fetching tweet ${tweetId}:`)
       console.error(`  Status: ${error.response?.status}`)
       console.error(`  Message: ${errorMsg}`)
       console.error(`  Response: ${JSON.stringify(error.response?.data)}`)
-      
+
       if (error.response?.status === 401) {
         console.error(`  ❌ Authentication failed - check your TWITTER_API_KEY`)
       } else if (error.response?.status === 404) {
@@ -359,18 +376,41 @@ async function getRatingFromGPT(
       return null // Return null instead of default rating
     }
 
-    const prompt = `You are rating Twitter replies based on how good they are relative to the original tweet.
+    const prompt = `
+You are an AI evaluator for a professional Web3 reply guy agency. Your sole job is to rate how effective a reply is at increasing engagement, relevance, and influence under the original tweet.
 
-Original Tweet: "${originalText}"
-Reply: "${replyText}"
+You are rating a reply made under a tweet. You must output only a single number from 1 to 10 (no explanation).
 
-Output only a single number between 1 and 10 representing the quality of the reply.
+Judge the reply based on these weighted criteria:
 
+Relevance (25%) - Does it directly respond to the idea, tone, or context of the original tweet? Is it clearly connected?
+
+Engagement Value (25%) - Is it likely to get likes, replies, or further conversation? Does it add energy, curiosity, or emotion?
+
+Positioning & Social Signaling (20%) - Does it make the reply writer look sharp, plugged-in, high IQ, or aligned with crypto culture?
+
+Human-Like Authenticity (15%) - Does it sound natural, not AI-generated or forced? Does it match the informal, meme-aware Web3 voice?
+
+Virality Hook (15%) - Does it have a hook (alpha insight, humor, callout, contrarian take, meme reference, bold claim) that could make it spread?
+
+Scoring Interpretation:
+
+9-10: Highly engaging, viral potential, exactly what a top reply guy would post.
+
+7-8: Solid and relevant, would likely get engagement.
+
+5-6: Average, safe, somewhat bland, low chance of engagement.
+
+3-4: Poor relevance or energy.
+
+1-2: Spammy, off-topic, cringe, or engagement-killing.
 Consider factors like:
 - Relevance to the original tweet
 - Quality of the response
 - Constructiveness
 - Engagement value
+Original Tweet: "${originalText}"
+Reply: "${replyText}"
 
 Respond with just the number.`
 

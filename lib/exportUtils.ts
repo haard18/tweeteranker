@@ -4,11 +4,12 @@ export interface ExportData {
   originalTweetText: string
   replyText: string
   rating: number | null
+  replyUrl?: string
   error?: string
 }
 
 export function exportToCSV(data: ExportData[]): string {
-  const headers = ['replyId', 'tweetId', 'originalTweetText', 'replyText', 'rating']
+  const headers = ['replyId', 'tweetId', 'originalTweetText', 'replyText', 'rating', 'replyUrl']
   const rows = [headers]
 
   for (const item of data) {
@@ -18,6 +19,7 @@ export function exportToCSV(data: ExportData[]): string {
       escapeCSV(item.originalTweetText),
       escapeCSV(item.replyText),
       String(item.rating ?? ''),
+      escapeCSV(item.replyUrl || ''),
     ])
   }
 

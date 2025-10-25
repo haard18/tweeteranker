@@ -9,6 +9,7 @@ export interface RatingResult {
   originalTweetText: string
   replyText: string
   rating: number | null
+  replyUrl?: string
   error?: string
 }
 
