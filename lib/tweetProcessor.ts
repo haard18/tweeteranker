@@ -23,6 +23,12 @@ const twitterApiKey = process.env.TWITTER_API_KEY
 const twitterApiUrl = process.env.TWITTER_API_URL
 const openaiApiKey = process.env.OPENAI_API_KEY
 
+// Configurable timeout settings for large datasets
+const TWITTER_TIMEOUT = parseInt(process.env.TWITTER_TIMEOUT || '30000', 10) // 30 seconds default
+const OPENAI_TIMEOUT = parseInt(process.env.OPENAI_TIMEOUT || '60000', 10) // 60 seconds default
+const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3', 10) // 3 retries default
+const RETRY_DELAY = parseInt(process.env.RETRY_DELAY || '1000', 10) // 1 second default
+
 // Validate that API keys are configured
 if (!twitterApiKey) {
   console.warn('⚠️  WARNING: TWITTER_API_KEY is not configured')
@@ -38,16 +44,60 @@ const twitterAxios = axios.create({
   headers: {
     'X-API-Key': twitterApiKey || '',
   },
-  timeout: 10000,
+  timeout: TWITTER_TIMEOUT,
 })
 
-const openai = new OpenAI({ apiKey: openaiApiKey })
+const openai = new OpenAI({ 
+  apiKey: openaiApiKey,
+  timeout: OPENAI_TIMEOUT,
+})
 
 // Cache to avoid redundant API calls
 const tweetCache = new Map<string, Tweet>()
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = MAX_RETRIES,
+  baseDelay: number = RETRY_DELAY
+): Promise<T | null> {
+  let lastError: Error | null = null
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn()
+    } catch (error) {
+      lastError = error as Error
+      const isTimeoutError = error instanceof axios.AxiosError && 
+        (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT')
+      
+      const isRateLimitError = error instanceof axios.AxiosError && 
+        error.response?.status === 429
+
+      const isServerError = error instanceof axios.AxiosError && 
+        error.response?.status && error.response.status >= 500
+
+      // Only retry on timeout, rate limit, or server errors
+      if (!isTimeoutError && !isRateLimitError && !isServerError) {
+        throw error
+      }
+
+      if (attempt === maxRetries) {
+        console.error(`❌ Max retries (${maxRetries}) exceeded for operation`)
+        throw lastError
+      }
+
+      const delayMs = baseDelay * Math.pow(2, attempt - 1) // Exponential backoff
+      console.warn(`⚠️  Attempt ${attempt}/${maxRetries} failed: ${lastError.message}`)
+      console.warn(`   Retrying in ${delayMs}ms...`)
+      await delay(delayMs)
+    }
+  }
+
+  throw lastError
 }
 
 function buildTweetUrl(id?: string): string | undefined {
@@ -58,29 +108,41 @@ function buildTweetUrl(id?: string): string | undefined {
 
 export async function processTweets(rows: CSVRow[]): Promise<RatingResult[]> {
   const results: RatingResult[] = []
+  const batchSize = parseInt(process.env.BATCH_SIZE || '50', 10) // Process in batches for large datasets
+  const totalBatches = Math.ceil(rows.length / batchSize)
 
-  for (let i = 0; i < rows.length; i++) {
-    try {
-      const row = rows[i]
-      const replyId = row.replyId
-      const tweetId = row.tweetId
-  const replyUrl = buildTweetUrl(tweetId || replyId)
+  console.log(`📊 Processing ${rows.length} tweets in ${totalBatches} batches of ${batchSize}`)
+  
+  for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+    const batchStart = batchIndex * batchSize
+    const batchEnd = Math.min(batchStart + batchSize, rows.length)
+    const batch = rows.slice(batchStart, batchEnd)
+    
+    console.log(`\n🔄 Processing batch ${batchIndex + 1}/${totalBatches} (tweets ${batchStart + 1}-${batchEnd})`)
+    
+    for (let i = 0; i < batch.length; i++) {
+      const globalIndex = batchStart + i
+      try {
+        const row = batch[i]
+        const replyId = row.replyId
+        const tweetId = row.tweetId
+        const replyUrl = buildTweetUrl(tweetId || replyId)
 
-      // Only replyId and tweetId are strictly required
-      if (!replyId || !tweetId) {
-        results.push({
-          replyId: replyId || 'unknown',
-          tweetId: tweetId || 'unknown',
-          originalTweetText: '',
-          replyText: '',
-          rating: null,
-          replyUrl,
-          error: 'Missing required fields (replyId and tweetId)',
-        })
-        continue
-      }
+        // Only replyId and tweetId are strictly required
+        if (!replyId || !tweetId) {
+          results.push({
+            replyId: replyId || 'unknown',
+            tweetId: tweetId || 'unknown',
+            originalTweetText: '',
+            replyText: '',
+            rating: null,
+            replyUrl,
+            error: 'Missing required fields (replyId and tweetId)',
+          })
+          continue
+        }
 
-      console.log(`\n📊 Processing tweet ${i + 1}/${rows.length}: ${tweetId}`)
+        console.log(`\n📊 Processing tweet ${globalIndex + 1}/${rows.length}: ${tweetId}`)
 
       // Fetch reply tweet to get both text and inReplyToId
       const replyTweet = await fetchTweet(tweetId)
@@ -139,21 +201,32 @@ export async function processTweets(rows: CSVRow[]): Promise<RatingResult[]> {
         error: !rating ? 'Could not complete rating' : undefined,
       })
 
-    } catch (error) {
-      console.error(`✗ Error processing tweet ${rows[i].tweetId}:`, error)
-      results.push({
-        replyId: rows[i].replyId || 'unknown',
-        tweetId: rows[i].tweetId || 'unknown',
-        originalTweetText: rows[i].originalTweetText || '',
-        replyText: rows[i].replyText || '',
-        rating: null,
-        replyUrl: buildTweetUrl(rows[i].tweetId || rows[i].replyId),
-        error: (error as Error).message,
-      })
-    }
+      } catch (error) {
+        console.error(`✗ Error processing tweet ${batch[i].tweetId}:`, error)
+        results.push({
+          replyId: batch[i].replyId || 'unknown',
+          tweetId: batch[i].tweetId || 'unknown',
+          originalTweetText: batch[i].originalTweetText || '',
+          replyText: batch[i].replyText || '',
+          rating: null,
+          replyUrl: buildTweetUrl(batch[i].tweetId || batch[i].replyId),
+          error: (error as Error).message,
+        })
+      }
 
-    // Add delay to respect rate limits
-    await delay(500)
+      // Add delay to respect rate limits
+      await delay(500)
+    }
+    
+    // Log batch completion
+    console.log(`✅ Batch ${batchIndex + 1}/${totalBatches} complete`)
+    
+    // Add longer delay between batches for large datasets
+    if (batchIndex < totalBatches - 1) {
+      const batchDelay = parseInt(process.env.BATCH_DELAY || '2000', 10) // 2 seconds default
+      console.log(`⏳ Waiting ${batchDelay}ms before next batch...`)
+      await delay(batchDelay)
+    }
   }
 
   console.log(`\n✅ Processing complete. ${results.filter(r => r.rating).length}/${rows.length} tweets rated.`)
@@ -319,7 +392,14 @@ async function fetchTweet(tweetId: string): Promise<Tweet | null> {
     console.log(`  URL: ${url}`)
     console.log(`  Header: X-API-Key: ${twitterApiKey.substring(0, 10)}...`)
 
-    const response = await twitterAxios.get(url)
+    const response = await retryWithBackoff(async () => {
+      return await twitterAxios.get(url)
+    })
+
+    if (!response) {
+      console.error(`❌ Failed to fetch tweet ${tweetId} after retries`)
+      return null
+    }
 
     console.log(`← Tweet response status: ${response.status}`)
 
@@ -415,16 +495,23 @@ Reply: "${replyText}"
 Respond with just the number.`
 
     console.log('  → Sending request to OpenAI...')
-    const message = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      max_tokens: 10,
-      messages: [
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
+    const message = await retryWithBackoff(async () => {
+      return await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        max_tokens: 10,
+        messages: [
+          {
+            role: 'user',
+            content: prompt,
+          },
+        ],
+      })
     })
+
+    if (!message) {
+      console.error(`❌ Failed to get rating from OpenAI after retries`)
+      return null
+    }
 
     const content = message.choices[0]?.message?.content
     if (content) {
